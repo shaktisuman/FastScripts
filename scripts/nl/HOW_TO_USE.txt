@@ -1,0 +1,269 @@
+===============================================================================
+ nl2lldb - How To Use
+ Translate natural-language English into valid LLDB debugger commands.
+ Version 1.0.0
+===============================================================================
+
+CONTENTS
+  1.  What it does
+  2.  Requirements
+  3.  Installation
+  4.  Command-line usage
+  5.  Out-of-order (n-gram) input
+  6.  Suggestions when a command can't be formed
+  7.  Python API
+  8.  The Translation object
+  9.  Validation backends (static vs. live LLDB)
+  10. Running the tests and benchmarks
+  11. How it works (short version)
+  12. Limitations
+  13. License
+
+
+-------------------------------------------------------------------------------
+1. WHAT IT DOES
+-------------------------------------------------------------------------------
+nl2lldb turns plain-English debugging requests into the exact LLDB command you
+would type at the (lldb) prompt:
+
+    "set a breakpoint at main"        ->  breakpoint set --name main
+    "step over"                       ->  thread step-over
+    "read 16 bytes at 0x1000"         ->  memory read --count 16 0x1000
+    "watch the variable counter"      ->  watchpoint set variable counter
+    "backtrace all threads"           ->  thread backtrace --all
+
+It covers the full standard LLDB command set (every top-level command and its
+sub-commands). Every command it emits is the canonical form (not an alias), and
+its command path is validated - against LLDB itself when available, or against a
+bundled command tree otherwise.
+
+
+-------------------------------------------------------------------------------
+2. REQUIREMENTS
+-------------------------------------------------------------------------------
+* Python 3.8 or newer.
+* No third-party dependencies (standard library only).
+* LLDB is OPTIONAL. If the Python "lldb" module is importable, nl2lldb validates
+  against the live command interpreter; otherwise it uses its bundled command
+  tree and works exactly the same way.
+
+
+-------------------------------------------------------------------------------
+3. INSTALLATION
+-------------------------------------------------------------------------------
+Option A - run it directly (no install):
+
+    python3 nl2lldb.py "set a breakpoint at main"
+
+Option B - install it (gives you the `nl2lldb` command and an importable module):
+
+    pip install .
+
+    # then, from anywhere:
+    nl2lldb "set a breakpoint at main"
+
+To validate against your real LLDB, run with the Python that ships with your
+toolchain, e.g. on macOS:
+
+    xcrun python3 -c "import lldb"        # confirm lldb is importable
+    xcrun python3 nl2lldb.py "step over"
+
+
+-------------------------------------------------------------------------------
+4. COMMAND-LINE USAGE
+-------------------------------------------------------------------------------
+    nl2lldb [TEXT ...] [--json] [--verbose|-v] [--static] [--demo] [--version]
+
+Arguments / flags:
+    TEXT          The natural-language request. If omitted, requests are read
+                  from standard input, one per line.
+    --json        Emit a JSON object (or a JSON array for multiple inputs).
+    --verbose,-v  Also print the intent, confidence, and any notes/suggestions;
+                  prints the active validation backend to stderr.
+    --static      Force the bundled command tree (skip importing lldb).
+    --demo        Run a built-in demonstration set.
+    --version     Print the version and exit.
+
+Examples:
+
+    $ nl2lldb "set a breakpoint at foo.c:42"
+    breakpoint set --file foo.c --line 42
+
+    $ nl2lldb --verbose "delete breakpoint 3"
+    breakpoint delete 3
+        intent: breakpoint_delete   confidence: 1.0
+
+    # read several requests from a file, one per line:
+    $ cat requests.txt | nl2lldb
+
+    # machine-readable output:
+    $ nl2lldb --json "step over"
+    {
+      "input": "step over",
+      "command": "thread step-over",
+      "intent": "thread_step_over",
+      "confidence": 1.0,
+      "valid": true,
+      "complete": true,
+      "suggestions": [],
+      "notes": []
+    }
+
+
+-------------------------------------------------------------------------------
+5. OUT-OF-ORDER (N-GRAM) INPUT
+-------------------------------------------------------------------------------
+Words do NOT have to be in the usual order. An order-independent matching layer
+recognises the request even when the words are shuffled:
+
+    "main breakpoint set"      ->  breakpoint set --name main
+    "at main set breakpoint"   ->  breakpoint set --name main
+    "rax read register"        ->  register read rax
+    "watchpoints all list"     ->  watchpoint list
+    "going keep"               ->  process continue
+
+When a normal, in-order phrase is present it is used as-is (precise behaviour);
+the order-independent ranking only takes over when the words are scrambled or
+only weak signals are present.
+
+
+-------------------------------------------------------------------------------
+6. SUGGESTIONS WHEN A COMMAND CAN'T BE FORMED
+-------------------------------------------------------------------------------
+If a complete, valid command cannot be produced, nl2lldb always returns helpful
+suggestions instead of failing silently:
+
+* Empty input            -> the list of top-level commands.
+* A command group only    -> that group's sub-commands.
+      $ nl2lldb "breakpoint"
+      # 'breakpoint' names a command group ...; choose a sub-command:
+        suggestions: breakpoint set, breakpoint list, breakpoint delete, ...
+* Recognised but underspecified -> the partial command plus how to complete it.
+      $ nl2lldb "set a breakpoint"
+      breakpoint set    # incomplete -- needs more info.
+        suggestions: breakpoint set --name <function>,
+                     breakpoint set --file <file> --line <n>,
+                     breakpoint set --address <0xADDRESS>
+* Unrecognised request    -> the closest commands / top-level command list.
+
+In the Python API these appear in the `suggestions` list (see section 8), and
+the `complete` / `valid` flags tell you what kind of result you got.
+
+
+-------------------------------------------------------------------------------
+7. PYTHON API
+-------------------------------------------------------------------------------
+    from nl2lldb import make_translator
+
+    t = make_translator()                 # auto-detect LLDB; cached
+    print(t.translate("step over").command)        # 'thread step-over'
+
+    # Translate many at once:
+    for r in t.translate_many(["continue", "list breakpoints"]):
+        print(r.input, "->", r.command)
+
+make_translator(force_static=False, low_threshold=4, cache_size=4096,
+                ngram_weight=0.5) -> Translator
+    force_static   True forces the bundled command tree (don't import lldb).
+    low_threshold  Below this score a "low confidence" note is attached.
+    cache_size     LRU cache size for translate(); 0/None disables caching.
+    ngram_weight   Influence of the order-independent layer (0 disables it).
+
+Translator methods:
+    translate(text)        -> Translation        (cached)
+    translate_many(texts)  -> list[Translation]
+    cache_info()           -> lru_cache stats (or None)
+    cache_clear()          -> clear translation + backend caches
+
+Other useful entry points:
+    extract(text)          -> Extracted          (the parsed entities)
+    get_backend(force_static=False)              (the validation backend)
+
+
+-------------------------------------------------------------------------------
+8. THE TRANSLATION OBJECT
+-------------------------------------------------------------------------------
+translate() returns a frozen Translation dataclass:
+
+    input        the original request string
+    command      the LLDB command string, or None if nothing could be formed
+    intent       internal intent name that matched (e.g. 'breakpoint_set')
+    confidence   0.0 - 1.0 score
+    valid        True if `command`'s path validates against the backend
+    complete     True if no required argument was missing
+    suggestions  list[str] of next steps / sub-commands / completions
+    notes        list[str] of human-readable notes (low confidence, etc.)
+
+    .to_dict()   -> a plain dict (used by --json)
+    str(result)  -> the command, or "<cmd>  # incomplete ..." with suggestions,
+                    or "# could not translate." with suggestions
+
+Rule of thumb: a fully successful result has command set, valid=True,
+complete=True, and suggestions == []. Anything else carries suggestions.
+
+
+-------------------------------------------------------------------------------
+9. VALIDATION BACKENDS (STATIC VS. LIVE LLDB)
+-------------------------------------------------------------------------------
+Both backends expose the same interface, so behaviour is identical:
+
+* StaticBackend - walks the bundled command tree. Always available; used for
+  deterministic tests and when LLDB is not installed.
+* LLDBBackend - uses SBCommandInterpreter.CommandExists and HandleCompletion to
+  confirm a command path and enumerate sub-commands, and 'help <path>' for help.
+  Picks up plugin-added commands automatically.
+
+get_backend() auto-detects; pass force_static=True (or --static on the CLI) to
+always use the bundled tree.
+
+
+-------------------------------------------------------------------------------
+10. RUNNING THE TESTS AND BENCHMARKS
+-------------------------------------------------------------------------------
+Tests (no third-party dependency needed; also pytest-compatible):
+
+    python3 test_nl2lldb.py          # built-in runner, prints PASS/FAIL tally
+    pytest test_nl2lldb.py           # if you have pytest
+
+Accuracy benchmarks:
+
+    python3 benchmark_nl2lldb.py            # in-order accuracy (labelled set)
+    python3 benchmark_nl2lldb.py --misses   # show only the misses
+    python3 benchmark_ngram_nl2lldb.py      # out-of-order (scrambled) accuracy
+    python3 benchmark_ngram_nl2lldb.py --misses
+
+Current results: in-order 176/176 exact-match (100%), scrambled 44/44 (100%),
+command validity 100%, 61 unit tests passing.
+
+
+-------------------------------------------------------------------------------
+11. HOW IT WORKS (SHORT VERSION)
+-------------------------------------------------------------------------------
+1. extract() pulls out entities with pre-compiled regexes: file:line, address,
+   pid, numbers, function/variable/register names, conditions, expressions.
+2. ~50 intents score the input. Each intent has weighted regex "signals"
+   (order-sensitive) and an order-independent "bag" compiled from those same
+   signals (sequence => AND, (?:a|b) => OR, trailing ? => optional, \s* allows a
+   joined word). Discriminative words are weighted higher (idf).
+3. A strong in-order phrase wins outright; otherwise the order-independent score
+   decides, so scrambled input still resolves.
+4. The winning intent renders the command, which is validated by the backend.
+   If it isn't valid+complete, suggestions are attached.
+Results are cached per Translator (LRU), so repeated inputs are essentially free.
+
+
+-------------------------------------------------------------------------------
+12. LIMITATIONS
+-------------------------------------------------------------------------------
+* Distinguishing 'thread step-inst' from 'thread step-inst-over' under heavy
+  word-scrambling is inherently ambiguous (the word "instruction" alone is a
+  strong step-inst signal), so those scrambles may map to the sibling command.
+* A single-letter identifier that collides with an LLDB alias (e.g. "x", the
+  examine-memory alias) is treated as the alias rather than a variable name.
+* Free-form expressions are best given in order after print/po/expression.
+
+
+-------------------------------------------------------------------------------
+13. LICENSE
+-------------------------------------------------------------------------------
+MIT License. See the LICENSE file.
